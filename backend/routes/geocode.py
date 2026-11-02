@@ -1,0 +1,291 @@
+"""
+Route: POST /geocode-zone
+
+Resolves a free-text Bengaluru area / zone name into geographic coordinates.
+Hybrid Approach: Uses Groq (LLM) to parse the free-text description into a clean 
+location name, and then uses  LocationIQ to look up the exact lat/long.
+
+This endpoint is called from the Submit Incident form (View 2) ONLY.
+It is NOT used by the anomaly monitor "Generate Plan" path.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+from typing import Any, Dict, List, Optional
+
+import requests
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# System prompt for the geocoding agent (LLM parsing)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = """You are a smart location parser. Your job is to take a user's conversational description of a location in Bengaluru (Bangalore) and resolve it into a clean, canonical place name.
+
+Rules:
+1. If the input is a well-known, specific location, return a SINGLE high-confidence result.
+2. If the input is vague or could refer to multiple places (e.g. "near the big mall"), return 2 to 3 distinct candidate locations.
+3. CRITICAL: Keep the resolved name as short and canonical as possible. Do NOT append specific neighborhoods, sectors, or localities unless the user explicitly typed them. (e.g. if the user says "phoenix mall", return "Phoenix Marketcity", DO NOT return "Phoenix Marketcity, Whitefield").
+4. ALWAYS append the correct city and state to the resolved name (e.g. ", Bengaluru, Karnataka" or ", Mangaluru, Karnataka"). This is critical for the map API to find it.
+5. Return dummy values for lat and lng (like 12.0 and 77.0), we will fetch the real coordinates from a map API later. Your only job is to provide the correct "resolved_name" or candidate "name"s.
+
+RESPONSE FORMAT — return ONLY valid JSON, no markdown, no explanation:
+
+For a specific, unambiguous location:
+{"confidence": "high", "lat": 12.0, "lng": 77.0, "resolved_name": "<canonical name, city, state>"}
+
+For an ambiguous or vague input:
+{"confidence": "ambiguous", "candidates": [{"name": "<place name, city, state>", "lat": 12.0, "lng": 77.0}, ...]}
+
+If the location cannot be parsed at all:
+{"confidence": "failed", "message": "<brief reason>"}
+"""
+
+_FEW_SHOT_USER = "Koramangala"
+_FEW_SHOT_MODEL = json.dumps({
+    "confidence": "high",
+    "lat": 12.0,
+    "lng": 77.0,
+    "resolved_name": "Koramangala, Bengaluru"
+})
+
+_FEW_SHOT_USER_2 = "Layout near old airport"
+_FEW_SHOT_MODEL_2 = json.dumps({
+    "confidence": "ambiguous",
+    "candidates": [
+        {"name": "Jeevan Bima Nagar, Bengaluru, Karnataka", "lat": 12.0, "lng": 77.0},
+        {"name": "HAL Airport, Bengaluru, Karnataka", "lat": 12.0, "lng": 77.0},
+        {"name": "New Thippasandra, Bengaluru, Karnataka", "lat": 12.0, "lng": 77.0}
+    ]
+})
+
+_FEW_SHOT_USER_3 = "Panambur beach"
+_FEW_SHOT_MODEL_3 = json.dumps({
+    "confidence": "high",
+    "lat": 12.9,
+    "lng": 74.8,
+    "resolved_name": "Panambur Beach, Mangaluru, Karnataka"
+})
+
+# ---------------------------------------------------------------------------
+# Request / Response schemas
+# ---------------------------------------------------------------------------
+
+class GeocodeZoneRequest(BaseModel):
+    zone: str
+
+# ---------------------------------------------------------------------------
+# Internal Logic
+# ---------------------------------------------------------------------------
+
+def _call_groq_parser(zone_input: str) -> Optional[Dict[str, Any]]:
+    """Calls Groq to parse conversational text into a canonical place name."""
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        logger.warning("No Groq API key found — parsing cannot proceed.")
+        return None
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {groq_key}"}
+    payload = {
+        "model": "groq/compound-mini",
+        "temperature": 0.0,
+        "messages": [
+            {"role": "system",    "content": _SYSTEM_PROMPT},
+            {"role": "user",      "content": _FEW_SHOT_USER},
+            {"role": "assistant", "content": _FEW_SHOT_MODEL},
+            {"role": "user",      "content": _FEW_SHOT_USER_2},
+            {"role": "assistant", "content": _FEW_SHOT_MODEL_2},
+            {"role": "user",      "content": _FEW_SHOT_USER_3},
+            {"role": "assistant", "content": _FEW_SHOT_MODEL_3},
+            {"role": "user",      "content": zone_input.strip()},
+        ],
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        raw_text = resp.json()["choices"][0]["message"]["content"].strip()
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+        raw_text = re.sub(r"\s*```$", "", raw_text)
+        return json.loads(raw_text)
+    except Exception as exc:
+        logger.error("Groq parser error: %s", exc)
+        return None
+
+import time
+import functools
+import threading
+
+# Global lock to ensure only one LocationIQ request happens at a time across all threads
+_locationiq_lock = threading.Lock()
+
+@functools.lru_cache(maxsize=256)
+def _fetch_coordinates(place_name: str) -> Optional[tuple[float, float]]:
+    """Calls LocationIQ to fetch exact lat/lng for a given place name."""
+    query = place_name.strip()
+    
+    locationiq_key = os.environ.get("LOCATIONIQ_API_KEY")
+    if not locationiq_key:
+        logger.error("LOCATIONIQ_API_KEY is not set. Geocoding cannot proceed.")
+        return None
+
+    logger.info("  -> Calling LocationIQ with query: %r", query)
+
+    url = "https://us1.locationiq.com/v1/search"
+    params = {"key": locationiq_key, "q": query, "format": "json", "limit": 1, "countrycodes": "in"}
+    headers = {"User-Agent": "SmartTrafficIntelligence/1.3"}
+
+    for attempt in range(2):
+        try:
+            # We acquire the global lock before making the request
+            with _locationiq_lock:
+                # LocationIQ allows 2 req/sec. We sleep 1.1s to be safe.
+                time.sleep(1.1)
+                resp = requests.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                logger.warning("LocationIQ rate limited (429). Sleeping for 2 seconds and retrying...")
+                time.sleep(2)
+                continue
+            
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Verify the geocoder didn't ignore the specific place and return a generic city center
+            if data and "," in query:
+                core_name = query.split(",")[0].strip()
+                core_name_clean = core_name.lower().replace(" layout", "")
+                display_name = data[0].get("display_name", "").lower()
+                
+                # if the specific place name isn't anywhere in the result, the geocoder ignored it
+                if core_name_clean not in display_name:
+                    logger.warning("  -> LocationIQ ignored core name %r. Rejecting generic result: %s", core_name_clean, data[0].get("display_name", "Unknown"))
+                    data = [] # force the fallback block below
+                    
+            if data:
+                logger.info("  -> LocationIQ returned: %s (lat: %s, lon: %s)", data[0].get("display_name", "Unknown"), data[0]["lat"], data[0]["lon"])
+                return float(data[0]["lat"]), float(data[0]["lon"])
+                
+            # Fallback: strip out ", Bengaluru" or ", Karnataka" and try the core name
+            if "," in query:
+                core_name = query.split(",")[0].strip()
+                # Also try removing " Layout" if the LLM hallucinated it
+                if core_name.lower().endswith(" layout"):
+                    core_name = core_name[:-7].strip()
+                    
+                logger.info("  -> LocationIQ failed, trying fallback query: %r", core_name)
+                params["q"] = core_name
+                # Respect rate limit for second call by using the global lock
+                with _locationiq_lock:
+                    time.sleep(1.1)
+                    resp = requests.get(url, params=params, headers=headers, timeout=15)
+                
+                if resp.status_code == 429:
+                    logger.warning("LocationIQ rate limited (429) on fallback. Sleeping for 2 seconds...")
+                    time.sleep(2)
+                    with _locationiq_lock:
+                        time.sleep(1.1)
+                        resp = requests.get(url, params=params, headers=headers, timeout=15)
+                    
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    logger.info("  -> LocationIQ fallback returned: %s (lat: %s, lon: %s)", data[0].get("display_name", "Unknown"), data[0]["lat"], data[0]["lon"])
+                    return float(data[0]["lat"]), float(data[0]["lon"])
+            
+            logger.info("  -> LocationIQ returned NO RESULTS for this query.")
+            # If we reach here, we successfully made the requests but got no data
+            break
+            
+        except Exception as exc:
+            if "429" in str(exc) and attempt == 0:
+                logger.warning("LocationIQ rate limited exception (429). Sleeping for 2 seconds and retrying...")
+                time.sleep(2)
+                continue
+            logger.error("LocationIQ lookup failed: %s", exc)
+            break
+            
+    return None
+
+def _hybrid_geocode(zone_input: str) -> Optional[Dict[str, Any]]:
+    # 1. Ask LLM to parse
+    parsed = _call_groq_parser(zone_input)
+    if not parsed:
+        return None
+        
+    confidence = parsed.get("confidence", "failed")
+    logger.info("LLM Geocode Parser Output: confidence=%r", confidence)
+    
+    # 2. Fetch true coordinates from LocationIQ
+    if confidence == "high":
+        name = parsed.get("resolved_name", zone_input)
+        logger.info("LLM resolved high confidence name: %r", name)
+        coords = _fetch_coordinates(name)
+        if coords:
+            return {"confidence": "high", "lat": coords[0], "lng": coords[1], "resolved_name": name}
+        else:
+            return {"confidence": "failed", "message": f"Could not map coordinates for '{name}'."}
+            
+    elif confidence == "ambiguous":
+        candidates = parsed.get("candidates", [])
+        valid = []
+        logger.info("LLM returned %d ambiguous candidates. Verifying with LocationIQ...", len(candidates))
+        for c in candidates:
+            name = c.get("name", "Unknown")
+            coords = _fetch_coordinates(name)
+            if coords:
+                valid.append({"name": name, "lat": coords[0], "lng": coords[1]})
+        
+        if valid:
+            return {"confidence": "ambiguous", "candidates": valid}
+        else:
+            return {"confidence": "failed", "message": "Could not verify coordinates for candidate locations."}
+            
+    return parsed
+
+def _validate_bengaluru_coords(lat: float, lng: float) -> bool:
+    return 7.0 <= lat <= 19.0 and 72.0 <= lng <= 84.0
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@router.post("/geocode-zone", summary="Resolve a Bengaluru area to coordinates", tags=["Geocoding"])
+async def geocode_zone(request: GeocodeZoneRequest) -> Dict[str, Any]:
+    zone_input = (request.zone or "").strip()
+    if not zone_input:
+        return {"confidence": "failed", "message": "Zone name is empty."}
+
+    logger.info("Geocoding zone (Hybrid LLM+LocationIQ): %r", zone_input)
+
+    try:
+        # Enforce an absolute 25s timeout for the entire geocoding process
+        result = await asyncio.wait_for(asyncio.to_thread(_hybrid_geocode, zone_input), timeout=25.0)
+    except asyncio.TimeoutError:
+        logger.error("Geocoding process timed out.")
+        return {"confidence": "failed", "message": "Geocoding service timed out."}
+
+    if result is None:
+        return {"confidence": "failed", "message": "Geocoding service unavailable."}
+
+    # If it succeeded, apply bounds checking just to be safe
+    if result.get("confidence") == "high":
+        if not _validate_bengaluru_coords(result["lat"], result["lng"]):
+            return {"confidence": "failed", "message": "Resolved location is outside Bengaluru radius."}
+    elif result.get("confidence") == "ambiguous":
+        result["candidates"] = [
+            c for c in result["candidates"]
+            if _validate_bengaluru_coords(c["lat"], c["lng"])
+        ]
+        if not result["candidates"]:
+            return {"confidence": "failed", "message": "Resolved candidates outside Bengaluru radius."}
+
+    return result
